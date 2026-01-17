@@ -12,10 +12,21 @@ import simd
 
 let alignedUniformsSize = (MemoryLayout<Uniforms>.size + 0xFF) & -0x100
 let maxBuffersInFlight = 3
+private let defaultShadowMapSize = 1024
 
 enum RendererError: Error {
     case badVertexDescriptor
     case meshNotFound
+}
+
+extension LightData {
+    static var zero: LightData {
+        LightData(position: SIMD4<Float>(repeating: 0),
+                  direction: SIMD4<Float>(repeating: 0),
+                  color: SIMD4<Float>(repeating: 0),
+                  shadowParams: SIMD4<Float>(repeating: 0),
+                  shadowMatrix: matrix_identity_float4x4)
+    }
 }
 
 // Submesh with its texture
@@ -61,7 +72,7 @@ private struct AssetLoadResult {
     let boundsRadius: Float
 }
 
-final class ModelAnimationSystem: NSObject, GameSystem, RenderSystem {
+final class ModelAnimationSystem: NSObject, GameSystem, Renderable {
     
     public let device: MTLDevice
     var dynamicUniformBuffer: MTLBuffer
@@ -69,6 +80,8 @@ final class ModelAnimationSystem: NSObject, GameSystem, RenderSystem {
     var transparentPipelineState: MTLRenderPipelineState
     var depthState: MTLDepthStencilState
     var transparentDepthState: MTLDepthStencilState
+    var shadowPipelineState: MTLRenderPipelineState
+    var shadowDepthState: MTLDepthStencilState
     fileprivate var defaultMaterialTextures: MaterialTextures
     var defaultJointMatricesBuffer: MTLBuffer
     
@@ -107,18 +120,14 @@ final class ModelAnimationSystem: NSObject, GameSystem, RenderSystem {
     let textureLoader: MTKTextureLoader
     private let resourceName: String
     private let resourceExtension: String
-    private let lightSystem: LightingSystem
-    
     @MainActor
     init?(metalKitView: MTKView,
           resourceName: String = "robot",
-          resourceExtension: String = "usdz",
-          lightSystem: LightingSystem) {
+          resourceExtension: String = "usdz") {
         self.device = metalKitView.device!
         self.textureLoader = MTKTextureLoader(device: device)
         self.resourceName = resourceName
         self.resourceExtension = resourceExtension
-        self.lightSystem = lightSystem
         
         let uniformBufferSize = alignedUniformsSize * maxBuffersInFlight
         guard let buffer = self.device.makeBuffer(length: uniformBufferSize, options: [.storageModeShared]) else { return nil }
@@ -142,6 +151,8 @@ final class ModelAnimationSystem: NSObject, GameSystem, RenderSystem {
                                                                        metalKitView: metalKitView,
                                                                        mtlVertexDescriptor: mtlVertexDescriptor,
                                                                        enableBlending: true)
+            shadowPipelineState = try ModelAnimationSystem.buildShadowPipelineWithDevice(device: device,
+                                                                                         mtlVertexDescriptor: mtlVertexDescriptor)
         } catch {
             return nil
         }
@@ -157,7 +168,13 @@ final class ModelAnimationSystem: NSObject, GameSystem, RenderSystem {
         transparentDepthStateDescriptor.isDepthWriteEnabled = false
         guard let transState = device.makeDepthStencilState(descriptor: transparentDepthStateDescriptor) else { return nil }
         transparentDepthState = transState
-        
+
+        let shadowDepthDescriptor = MTLDepthStencilDescriptor()
+        shadowDepthDescriptor.depthCompareFunction = .less
+        shadowDepthDescriptor.isDepthWriteEnabled = true
+        guard let shadowState = device.makeDepthStencilState(descriptor: shadowDepthDescriptor) else { return nil }
+        shadowDepthState = shadowState
+
         // Create default textures for PBR slots
         guard let defaultBaseColor = ModelAnimationSystem.createSolidTexture(device: device,
                                                                             color: SIMD4<UInt8>(255, 255, 255, 255),
@@ -785,6 +802,37 @@ final class ModelAnimationSystem: NSObject, GameSystem, RenderSystem {
         
         return try device.makeRenderPipelineState(descriptor: pipelineDescriptor)
     }
+
+    @MainActor
+    class func buildShadowPipelineWithDevice(device: MTLDevice,
+                                             mtlVertexDescriptor: MTLVertexDescriptor) throws -> MTLRenderPipelineState {
+        let library = device.makeDefaultLibrary()
+        let vertexFunction = library?.makeFunction(name: "shadowVertexShader")
+
+        let pipelineDescriptor = MTLRenderPipelineDescriptor()
+        pipelineDescriptor.label = "ShadowMapPipeline"
+        pipelineDescriptor.vertexFunction = vertexFunction
+        pipelineDescriptor.fragmentFunction = nil
+        pipelineDescriptor.vertexDescriptor = mtlVertexDescriptor
+        pipelineDescriptor.colorAttachments[0].pixelFormat = .invalid
+        pipelineDescriptor.depthAttachmentPixelFormat = .depth32Float
+
+        return try device.makeRenderPipelineState(descriptor: pipelineDescriptor)
+    }
+
+    private static func makeShadowMapTexture(device: MTLDevice,
+                                             size: Int,
+                                             arrayLength: Int) -> MTLTexture? {
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .depth32Float,
+                                                                  width: size,
+                                                                  height: size,
+                                                                  mipmapped: false)
+        descriptor.textureType = .type2DArray
+        descriptor.arrayLength = max(arrayLength, 1)
+        descriptor.usage = [.renderTarget, .shaderRead]
+        descriptor.storageMode = .private
+        return device.makeTexture(descriptor: descriptor)
+    }
     
     func update(deltaTime: TimeInterval, frameIndex: Int) {
         currentFrameIndex = frameIndex % maxBuffersInFlight
@@ -989,35 +1037,112 @@ final class ModelAnimationSystem: NSObject, GameSystem, RenderSystem {
         for i in 0..<localTransforms.count { compute(i) }
         return globalTransforms
     }
+
+    private func drawShadowMeshes(renderEncoder: MTLRenderCommandEncoder, frameIndex: Int) {
+        for meshData in meshes {
+            let mtkMesh = meshData.mtkMesh
+            let jointBuffer: MTLBuffer
+            if let skinning = meshData.skinning, !skinning.jointMatricesBuffers.isEmpty {
+                let bufferIndex = frameIndex % skinning.jointMatricesBuffers.count
+                jointBuffer = skinning.jointMatricesBuffers[bufferIndex]
+            } else {
+                jointBuffer = defaultJointMatricesBuffer
+            }
+            renderEncoder.setVertexBuffer(jointBuffer, offset: 0, index: BufferIndex.jointMatrices.rawValue)
+
+            for (bufferIndex, vertexBuffer) in mtkMesh.vertexBuffers.enumerated() {
+                renderEncoder.setVertexBuffer(vertexBuffer.buffer, offset: vertexBuffer.offset, index: bufferIndex)
+            }
+
+            for submeshData in meshData.submeshes {
+                // Cast shadows for transparent submeshes too; some USDZ materials include opacity maps
+                // even when fully opaque, which would otherwise skip the shadow pass entirely.
+                let submesh = submeshData.submesh
+                renderEncoder.drawIndexedPrimitives(
+                    type: submesh.primitiveType,
+                    indexCount: submesh.indexCount,
+                    indexType: submesh.indexType,
+                    indexBuffer: submesh.indexBuffer.buffer,
+                    indexBufferOffset: submesh.indexBuffer.offset
+                )
+            }
+        }
+    }
     
-    func draw(renderEncoder: MTLRenderCommandEncoder,
-              frameIndex: Int,
-              viewMatrix: matrix_float4x4,
-              projectionMatrix: matrix_float4x4) {
-        // Compute modelViewMatrix using provided camera matrices
+    func encodeShadow(renderEncoder: MTLRenderCommandEncoder,
+                      frameIndex: Int,
+                      shadowMatrix: matrix_float4x4) {
+        renderEncoder.pushDebugGroup("Shadow Model")
+        renderEncoder.setRenderPipelineState(shadowPipelineState)
+        renderEncoder.setDepthStencilState(shadowDepthState)
+        renderEncoder.setCullMode(.none)
+        renderEncoder.setFrontFacing(.counterClockwise)
+
+        var shadowUniforms = ShadowUniforms(lightViewProjectionMatrix: shadowMatrix,
+                                            modelMatrix: modelMatrix)
+        renderEncoder.setVertexBytes(&shadowUniforms,
+                                     length: MemoryLayout<ShadowUniforms>.stride,
+                                     index: BufferIndex.shadowUniforms.rawValue)
+
+        drawShadowMeshes(renderEncoder: renderEncoder, frameIndex: frameIndex)
+        renderEncoder.popDebugGroup()
+    }
+
+    func encodeOpaque(renderEncoder: MTLRenderCommandEncoder,
+                      frameIndex: Int,
+                      viewMatrix: matrix_float4x4,
+                      projectionMatrix: matrix_float4x4,
+                      lightManager: LightManager) {
         uniforms[0].projectionMatrix = projectionMatrix
         uniforms[0].modelViewMatrix = simd_mul(viewMatrix, modelMatrix)
-        uniforms[0].lightDirection = lightSystem.lightDirectionInView(viewMatrix: viewMatrix)
-        uniforms[0].lightColor = lightSystem.lightColor
-        uniforms[0].ambientColor = lightSystem.ambientColor
-        
-        renderEncoder.pushDebugGroup("Draw Model")
+        uniforms[0].modelMatrix = modelMatrix
+        lightManager.applyLightUniforms(uniforms)
+        uniforms[0].padding0 = SIMD4<Float>(0, 0, lightManager.shadowStrength, lightManager.attenuationPower)
+
+        renderEncoder.pushDebugGroup("Draw Model Opaque")
         renderEncoder.setCullMode(.back)
         renderEncoder.setFrontFacing(.counterClockwise)
-        
-        renderEncoder.setVertexBuffer(dynamicUniformBuffer, offset: currentUniformBufferOffset, index: BufferIndex.uniforms.rawValue)
-        renderEncoder.setFragmentBuffer(dynamicUniformBuffer, offset: currentUniformBufferOffset, index: BufferIndex.uniforms.rawValue)
-        
-        // Pass 1: Opaque
+
+        renderEncoder.setVertexBuffer(dynamicUniformBuffer,
+                                      offset: currentUniformBufferOffset,
+                                      index: BufferIndex.uniforms.rawValue)
+        renderEncoder.setFragmentBuffer(dynamicUniformBuffer,
+                                        offset: currentUniformBufferOffset,
+                                        index: BufferIndex.uniforms.rawValue)
+        lightManager.bindLightResources(renderEncoder: renderEncoder)
+
         renderEncoder.setRenderPipelineState(pipelineState)
         renderEncoder.setDepthStencilState(depthState)
         drawMeshes(renderEncoder: renderEncoder, frameIndex: frameIndex, transparentPass: false)
-        
-        // Pass 2: Transparent
+        renderEncoder.popDebugGroup()
+    }
+
+    func encodeTransparent(renderEncoder: MTLRenderCommandEncoder,
+                           frameIndex: Int,
+                           viewMatrix: matrix_float4x4,
+                           projectionMatrix: matrix_float4x4,
+                           lightManager: LightManager) {
+        uniforms[0].projectionMatrix = projectionMatrix
+        uniforms[0].modelViewMatrix = simd_mul(viewMatrix, modelMatrix)
+        uniforms[0].modelMatrix = modelMatrix
+        lightManager.applyLightUniforms(uniforms)
+        uniforms[0].padding0 = SIMD4<Float>(0, 0, lightManager.shadowStrength, lightManager.attenuationPower)
+
+        renderEncoder.pushDebugGroup("Draw Model Transparent")
+        renderEncoder.setCullMode(.back)
+        renderEncoder.setFrontFacing(.counterClockwise)
+
+        renderEncoder.setVertexBuffer(dynamicUniformBuffer,
+                                      offset: currentUniformBufferOffset,
+                                      index: BufferIndex.uniforms.rawValue)
+        renderEncoder.setFragmentBuffer(dynamicUniformBuffer,
+                                        offset: currentUniformBufferOffset,
+                                        index: BufferIndex.uniforms.rawValue)
+        lightManager.bindLightResources(renderEncoder: renderEncoder)
+
         renderEncoder.setRenderPipelineState(transparentPipelineState)
         renderEncoder.setDepthStencilState(transparentDepthState)
         drawMeshes(renderEncoder: renderEncoder, frameIndex: frameIndex, transparentPass: true)
-
         renderEncoder.popDebugGroup()
     }
     
@@ -1117,6 +1242,27 @@ func matrix4x4_translation(_ x: Float, _ y: Float, _ z: Float) -> matrix_float4x
     ))
 }
 
+func matrix_look_at(eye: SIMD3<Float>,
+                    center: SIMD3<Float>,
+                    up: SIMD3<Float>) -> matrix_float4x4 {
+    let zAxis = normalize(eye - center)
+    let xAxis = normalize(cross(up, zAxis))
+    let yAxis = cross(zAxis, xAxis)
+
+    let translation = SIMD3<Float>(
+        -dot(xAxis, eye),
+        -dot(yAxis, eye),
+        -dot(zAxis, eye)
+    )
+
+    return matrix_float4x4(columns: (
+        SIMD4<Float>(xAxis.x, yAxis.x, zAxis.x, 0),
+        SIMD4<Float>(xAxis.y, yAxis.y, zAxis.y, 0),
+        SIMD4<Float>(xAxis.z, yAxis.z, zAxis.z, 0),
+        SIMD4<Float>(translation.x, translation.y, translation.z, 1)
+    ))
+}
+
 func matrix_perspective_right_hand(fovyRadians fovy: Float, aspectRatio: Float, nearZ: Float, farZ: Float) -> matrix_float4x4 {
     let ys = 1 / tanf(fovy * 0.5)
     let xs = ys / aspectRatio
@@ -1126,6 +1272,23 @@ func matrix_perspective_right_hand(fovyRadians fovy: Float, aspectRatio: Float, 
         vector_float4(0, ys, 0, 0),
         vector_float4(0, 0, zs, -1),
         vector_float4(0, 0, zs * nearZ, 0)
+    ))
+}
+
+func matrix_orthographic_right_hand(left: Float, right: Float,
+                                    bottom: Float, top: Float,
+                                    nearZ: Float, farZ: Float) -> matrix_float4x4 {
+    let ral = right - left
+    let tab = top - bottom
+    let fan = nearZ - farZ
+    return matrix_float4x4(columns: (
+        vector_float4(2 / ral, 0, 0, 0),
+        vector_float4(0, 2 / tab, 0, 0),
+        vector_float4(0, 0, 1 / fan, 0),
+        vector_float4(-(right + left) / ral,
+                      -(top + bottom) / tab,
+                      nearZ / fan,
+                      1)
     ))
 }
 

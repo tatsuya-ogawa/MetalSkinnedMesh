@@ -22,6 +22,8 @@ class GameViewController: UIViewController {
     private let modelResourceExtension = "usdz"
     private let toggleModeButton = UIButton(type: .system)
     private let stepButton = UIButton(type: .system)
+    private let shadowToggleButton = UIButton(type: .system)
+    private let volumeToggleButton = UIButton(type: .system)
     private let frameLabel = UILabel()
     private let lightPanelContainer = UIView()
     private let lightPanelStack = UIStackView()
@@ -29,13 +31,42 @@ class GameViewController: UIViewController {
     private let lightYSlider = UISlider()
     private let lightZSlider = UISlider()
     private let ambientSlider = UISlider()
+    private let shadowStrengthSlider = UISlider()
+    private let shadowNearSlider = UISlider()
+    private let shadowFarSlider = UISlider()
+    private let shadowFovSlider = UISlider()
+    private let lightIntensitySlider = UISlider()
+    private let lightAttenuationSlider = UISlider()
+    private let lightPrevButton = UIButton(type: .system)
+    private let lightNextButton = UIButton(type: .system)
+    private let lightIndexLabel = UILabel()
+    private let lightShadowSwitch = UISwitch()
+    private var lightColorButtons: [UIButton] = []
+    private let lightColorStack = UIStackView()
     private let lightXValueLabel = UILabel()
     private let lightYValueLabel = UILabel()
     private let lightZValueLabel = UILabel()
     private let ambientValueLabel = UILabel()
+    private let shadowStrengthValueLabel = UILabel()
+    private let shadowNearValueLabel = UILabel()
+    private let shadowFarValueLabel = UILabel()
+    private let shadowFovValueLabel = UILabel()
+    private let lightIntensityValueLabel = UILabel()
+    private let lightAttenuationValueLabel = UILabel()
+    private var selectedLightIndex: Int = 0
+    private let lightColorPalette: [SIMD3<Float>] = [
+        SIMD3<Float>(1.0, 0.9, 0.7),
+        SIMD3<Float>(1.0, 0.6, 0.3),
+        SIMD3<Float>(0.3, 0.8, 1.0),
+        SIMD3<Float>(0.8, 0.3, 1.0),
+        SIMD3<Float>(0.6, 1.0, 0.5),
+        SIMD3<Float>(1.0, 1.0, 1.0)
+    ]
     private var displayLink: CADisplayLink?
     private var lastDisplayTimestamp: CFTimeInterval?
     private let debugFPS: Double = 30.0
+    private var volumetricLightSystem: VolumetricLightSystem!
+    private var floorRenderable: FloorRenderable?
 
     override var canBecomeFirstResponder: Bool {
         true
@@ -77,8 +108,7 @@ class GameViewController: UIViewController {
         let lightSystem = LightingSystem()
         guard let newModelAnimationSystem = ModelAnimationSystem(metalKitView: mtkView,
                                                                  resourceName: modelResourceName,
-                                                                 resourceExtension: modelResourceExtension,
-                                                                 lightSystem: lightSystem) else {
+                                                                 resourceExtension: modelResourceExtension) else {
             print("ModelAnimationSystem cannot be initialized")
             return
         }
@@ -87,9 +117,32 @@ class GameViewController: UIViewController {
         self.cameraSystem = cameraSystem
         self.lightSystem = lightSystem
 
+        guard let lightManager = LightManager(metalKitView: mtkView, lightingSystem: lightSystem) else {
+            print("LightManager cannot be initialized")
+            return
+        }
         let radius = max(modelAnimationSystem.meshRadius, 0.001)
-        lightSystem.target = modelAnimationSystem.meshCenter
-        lightSystem.lightPosition = modelAnimationSystem.meshCenter + SIMD3<Float>(radius, radius, radius)
+
+        guard let newVolumetricLightSystem = VolumetricLightSystem(metalKitView: mtkView,
+                                                                   lightSystem: lightSystem) else {
+            print("VolumetricLightSystem cannot be initialized")
+            return
+        }
+        volumetricLightSystem = newVolumetricLightSystem
+
+        let worldCenter = SIMD3<Float>(repeating: 0)
+        let floorY = -radius * 0.75
+        let lightTarget = SIMD3<Float>(0, floorY, 0)
+        lightSystem.target = lightTarget
+        lightSystem.lightPosition = worldCenter + SIMD3<Float>(radius, radius * 1.8, radius)
+        lightSystem.shadowFar = max(radius * 6.0, 10.0)
+        configureColoredLights(center: worldCenter, target: lightTarget, radius: radius)
+
+        guard let floorRenderable = FloorRenderable(metalKitView: mtkView, radius: radius * 0.75) else {
+            print("FloorRenderable cannot be initialized")
+            return
+        }
+        self.floorRenderable = floorRenderable
         
         // Configure camera based on loaded model size
         cameraSystem.setTarget(radius: modelAnimationSystem.meshRadius)
@@ -97,8 +150,9 @@ class GameViewController: UIViewController {
         // Create scene with camera, game systems, and render systems
         scene = SceneManager(view: mtkView,
                      cameraSystem: cameraSystem,
+                     lightManager: lightManager,
                      gameSystems: [modelAnimationSystem, lightSystem],
-                     renderSystems: [modelAnimationSystem])
+                     renderables: [floorRenderable, modelAnimationSystem, volumetricLightSystem])
         
         guard let newRenderer = Renderer(metalKitView: mtkView, scene: scene) else {
             print("Renderer cannot be initialized")
@@ -126,6 +180,8 @@ class GameViewController: UIViewController {
     private func configureDebugButtons() {
         toggleModeButton.translatesAutoresizingMaskIntoConstraints = false
         stepButton.translatesAutoresizingMaskIntoConstraints = false
+        shadowToggleButton.translatesAutoresizingMaskIntoConstraints = false
+        volumeToggleButton.translatesAutoresizingMaskIntoConstraints = false
 
         toggleModeButton.setTitle("Auto: ON", for: .normal)
         toggleModeButton.addTarget(self, action: #selector(toggleAnimationMode), for: .touchUpInside)
@@ -142,8 +198,24 @@ class GameViewController: UIViewController {
         stepButton.contentEdgeInsets = UIEdgeInsets(top: 8, left: 12, bottom: 8, right: 12)
         stepButton.isHidden = true
 
+        shadowToggleButton.setTitle("Shadows: ON", for: .normal)
+        shadowToggleButton.addTarget(self, action: #selector(toggleShadows), for: .touchUpInside)
+        shadowToggleButton.backgroundColor = UIColor(white: 0.1, alpha: 0.7)
+        shadowToggleButton.setTitleColor(.white, for: .normal)
+        shadowToggleButton.layer.cornerRadius = 8
+        shadowToggleButton.contentEdgeInsets = UIEdgeInsets(top: 8, left: 12, bottom: 8, right: 12)
+
+        volumeToggleButton.setTitle("Volume: ON", for: .normal)
+        volumeToggleButton.addTarget(self, action: #selector(toggleVolumetric), for: .touchUpInside)
+        volumeToggleButton.backgroundColor = UIColor(white: 0.1, alpha: 0.7)
+        volumeToggleButton.setTitleColor(.white, for: .normal)
+        volumeToggleButton.layer.cornerRadius = 8
+        volumeToggleButton.contentEdgeInsets = UIEdgeInsets(top: 8, left: 12, bottom: 8, right: 12)
+
         view.addSubview(toggleModeButton)
         view.addSubview(stepButton)
+        view.addSubview(shadowToggleButton)
+        view.addSubview(volumeToggleButton)
 
         let safeArea = view.safeAreaLayoutGuide
         NSLayoutConstraint.activate([
@@ -151,7 +223,13 @@ class GameViewController: UIViewController {
             toggleModeButton.topAnchor.constraint(equalTo: safeArea.topAnchor, constant: 12),
 
             stepButton.leadingAnchor.constraint(equalTo: toggleModeButton.trailingAnchor, constant: 12),
-            stepButton.centerYAnchor.constraint(equalTo: toggleModeButton.centerYAnchor)
+            stepButton.centerYAnchor.constraint(equalTo: toggleModeButton.centerYAnchor),
+
+            shadowToggleButton.leadingAnchor.constraint(equalTo: stepButton.trailingAnchor, constant: 12),
+            shadowToggleButton.centerYAnchor.constraint(equalTo: toggleModeButton.centerYAnchor),
+
+            volumeToggleButton.leadingAnchor.constraint(equalTo: shadowToggleButton.trailingAnchor, constant: 12),
+            volumeToggleButton.centerYAnchor.constraint(equalTo: toggleModeButton.centerYAnchor)
         ])
 
         updateDebugButtonState()
@@ -175,7 +253,7 @@ class GameViewController: UIViewController {
         NSLayoutConstraint.activate([
             frameLabel.trailingAnchor.constraint(equalTo: safeArea.trailingAnchor, constant: -12),
             frameLabel.topAnchor.constraint(equalTo: safeArea.topAnchor, constant: 12),
-            frameLabel.leadingAnchor.constraint(greaterThanOrEqualTo: stepButton.trailingAnchor, constant: 12)
+            frameLabel.leadingAnchor.constraint(greaterThanOrEqualTo: volumeToggleButton.trailingAnchor, constant: 12)
         ])
     }
 
@@ -196,10 +274,18 @@ class GameViewController: UIViewController {
 
         lightPanelStack.addArrangedSubview(titleLabel)
 
+        configureLightSelectionControls()
+
         configureLightSlider(lightXSlider, valueLabel: lightXValueLabel, title: "X", tag: 0)
         configureLightSlider(lightYSlider, valueLabel: lightYValueLabel, title: "Y", tag: 1)
         configureLightSlider(lightZSlider, valueLabel: lightZValueLabel, title: "Z", tag: 2)
         configureLightSlider(ambientSlider, valueLabel: ambientValueLabel, title: "Ambient", tag: 3)
+        configureLightSlider(shadowStrengthSlider, valueLabel: shadowStrengthValueLabel, title: "Shadow", tag: 4)
+        configureLightSlider(shadowNearSlider, valueLabel: shadowNearValueLabel, title: "Near", tag: 5)
+        configureLightSlider(shadowFarSlider, valueLabel: shadowFarValueLabel, title: "Far", tag: 6)
+        configureLightSlider(shadowFovSlider, valueLabel: shadowFovValueLabel, title: "FOV", tag: 7)
+        configureLightSlider(lightIntensitySlider, valueLabel: lightIntensityValueLabel, title: "Intensity", tag: 8)
+        configureLightSlider(lightAttenuationSlider, valueLabel: lightAttenuationValueLabel, title: "Falloff", tag: 9)
 
         lightPanelContainer.addSubview(lightPanelStack)
         view.addSubview(lightPanelContainer)
@@ -216,7 +302,7 @@ class GameViewController: UIViewController {
             lightPanelStack.bottomAnchor.constraint(equalTo: lightPanelContainer.bottomAnchor, constant: -12)
         ])
 
-        let range = max(radius, 0.001) * 3.0
+        let range = max(radius, 0.001) * 10.0
         lightXSlider.minimumValue = -range
         lightXSlider.maximumValue = range
         lightYSlider.minimumValue = -range
@@ -226,15 +312,109 @@ class GameViewController: UIViewController {
 
         ambientSlider.minimumValue = 0.0
         ambientSlider.maximumValue = 1.0
+        shadowStrengthSlider.minimumValue = 0.0
+        shadowStrengthSlider.maximumValue = 1.0
+        shadowNearSlider.minimumValue = 0.001
+        shadowNearSlider.maximumValue = max(radius * 10.0, 50.0)
+        shadowFarSlider.minimumValue = 0.01
+        shadowFarSlider.maximumValue = max(radius * 40.0, 200.0)
+        shadowFovSlider.minimumValue = 1.0
+        shadowFovSlider.maximumValue = 179.0
+        lightIntensitySlider.minimumValue = 0.0
+        lightIntensitySlider.maximumValue = 5000.0
+        lightAttenuationSlider.minimumValue = 0.0
+        lightAttenuationSlider.maximumValue = 4.0
 
         if let lightSystem = lightSystem {
             lightXSlider.value = lightSystem.lightPosition.x
             lightYSlider.value = lightSystem.lightPosition.y
             lightZSlider.value = lightSystem.lightPosition.z
             ambientSlider.value = lightSystem.ambientIntensity
+            shadowStrengthSlider.value = lightSystem.shadowStrength
+            shadowNearSlider.value = lightSystem.shadowNear
+            shadowFarSlider.value = lightSystem.shadowFar
+            shadowFovSlider.value = lightSystem.outerConeAngle * 2.0 * 180.0 / Float.pi
+            lightAttenuationSlider.value = lightSystem.attenuationPower
         }
 
-        updateLightLabels()
+        selectLightIndex(selectedLightIndex)
+    }
+
+    private func configureLightSelectionControls() {
+        let selectLabel = UILabel()
+        selectLabel.text = "Edit Light"
+        selectLabel.textColor = .white
+        selectLabel.font = UIFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+        selectLabel.setContentHuggingPriority(.required, for: .horizontal)
+
+        lightPrevButton.setTitle("◀︎", for: .normal)
+        lightPrevButton.addTarget(self, action: #selector(selectPrevLight), for: .touchUpInside)
+        lightPrevButton.setContentHuggingPriority(.required, for: .horizontal)
+
+        lightNextButton.setTitle("▶︎", for: .normal)
+        lightNextButton.addTarget(self, action: #selector(selectNextLight), for: .touchUpInside)
+        lightNextButton.setContentHuggingPriority(.required, for: .horizontal)
+
+        lightIndexLabel.text = "1/1"
+        lightIndexLabel.textColor = .white
+        lightIndexLabel.font = UIFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+        lightIndexLabel.textAlignment = .center
+        lightIndexLabel.setContentHuggingPriority(.required, for: .horizontal)
+
+        let indexRow = UIStackView(arrangedSubviews: [lightPrevButton, lightIndexLabel, lightNextButton])
+        indexRow.axis = .horizontal
+        indexRow.spacing = 6
+        indexRow.alignment = .center
+
+        let selectRow = UIStackView(arrangedSubviews: [selectLabel, indexRow])
+        selectRow.axis = .horizontal
+        selectRow.spacing = 8
+        selectRow.alignment = .center
+
+        let shadowLabel = UILabel()
+        shadowLabel.text = "Cast Shadow"
+        shadowLabel.textColor = .white
+        shadowLabel.font = UIFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+        shadowLabel.setContentHuggingPriority(.required, for: .horizontal)
+
+        lightShadowSwitch.addTarget(self, action: #selector(lightShadowChanged(_:)), for: .valueChanged)
+        let shadowRow = UIStackView(arrangedSubviews: [shadowLabel, lightShadowSwitch])
+        shadowRow.axis = .horizontal
+        shadowRow.spacing = 8
+        shadowRow.alignment = .center
+
+        let colorLabel = UILabel()
+        colorLabel.text = "Color"
+        colorLabel.textColor = .white
+        colorLabel.font = UIFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+        colorLabel.setContentHuggingPriority(.required, for: .horizontal)
+
+        lightColorStack.axis = .horizontal
+        lightColorStack.spacing = 6
+        lightColorStack.distribution = .fillEqually
+        lightColorButtons = lightColorPalette.enumerated().map { index, color in
+            let button = UIButton(type: .system)
+            button.tag = index
+            button.layer.cornerRadius = 6
+            button.layer.borderWidth = 1
+            button.layer.borderColor = UIColor(white: 1.0, alpha: 0.4).cgColor
+            button.backgroundColor = UIColor(red: CGFloat(color.x),
+                                             green: CGFloat(color.y),
+                                             blue: CGFloat(color.z),
+                                             alpha: 1.0)
+            button.addTarget(self, action: #selector(lightColorTapped(_:)), for: .touchUpInside)
+            return button
+        }
+        lightColorButtons.forEach { lightColorStack.addArrangedSubview($0) }
+
+        let colorRow = UIStackView(arrangedSubviews: [colorLabel, lightColorStack])
+        colorRow.axis = .horizontal
+        colorRow.spacing = 8
+        colorRow.alignment = .center
+
+        lightPanelStack.addArrangedSubview(selectRow)
+        lightPanelStack.addArrangedSubview(shadowRow)
+        lightPanelStack.addArrangedSubview(colorRow)
     }
 
     private func configureLightSlider(_ slider: UISlider,
@@ -274,10 +454,111 @@ class GameViewController: UIViewController {
             lightSystem.lightPosition.z = sender.value
         case 3:
             lightSystem.ambientIntensity = sender.value
+        case 4:
+            lightSystem.shadowStrength = sender.value
+        case 5:
+            lightSystem.shadowNear = sender.value
+        case 6:
+            lightSystem.shadowFar = sender.value
+        case 7:
+            let fovDegrees = sender.value
+            lightSystem.outerConeAngle = radians_from_degrees(fovDegrees * 0.5)
+        case 8:
+            updateSelectedLight { $0.intensity = sender.value }
+            if selectedLightIndex == 0 {
+                lightSystem.lightIntensity = sender.value
+            }
+        case 9:
+            lightSystem.attenuationPower = sender.value
         default:
             break
         }
         updateLightLabels()
+    }
+
+    private func updateSelectedLightControls() {
+        guard let lightSystem = lightSystem, selectedLightIndex < lightSystem.lights.count else {
+            return
+        }
+        let light = lightSystem.lights[selectedLightIndex]
+        lightIntensitySlider.value = light.intensity
+        lightShadowSwitch.isOn = light.castsShadow
+        updateLightIndexLabel()
+        updateColorSelection(for: light.color)
+    }
+
+    private func updateSelectedLight(_ update: (inout LightingSystem.SpotLight) -> Void) {
+        guard let lightSystem = lightSystem, selectedLightIndex < lightSystem.lights.count else {
+            return
+        }
+        var light = lightSystem.lights[selectedLightIndex]
+        update(&light)
+        lightSystem.lights[selectedLightIndex] = light
+    }
+
+    private func updateLightIndexLabel() {
+        guard let lightSystem = lightSystem else { return }
+        let count = max(lightSystem.lights.count, 1)
+        let index = min(max(selectedLightIndex, 0), count - 1)
+        lightIndexLabel.text = "\(index + 1)/\(count)"
+        lightPrevButton.isEnabled = index > 0
+        lightNextButton.isEnabled = index < count - 1
+    }
+
+    private func updateColorSelection(for color: SIMD3<Float>) {
+        guard !lightColorButtons.isEmpty else { return }
+        var bestIndex = 0
+        var bestDistance = Float.greatestFiniteMagnitude
+        for (index, candidate) in lightColorPalette.enumerated() {
+            let delta = candidate - color
+            let distance = simd_length(delta)
+            if distance < bestDistance {
+                bestDistance = distance
+                bestIndex = index
+            }
+        }
+        for button in lightColorButtons {
+            if button.tag == bestIndex {
+                button.layer.borderWidth = 2
+                button.layer.borderColor = UIColor.white.cgColor
+            } else {
+                button.layer.borderWidth = 1
+                button.layer.borderColor = UIColor(white: 1.0, alpha: 0.4).cgColor
+            }
+        }
+    }
+
+    private func selectLightIndex(_ index: Int) {
+        guard let lightSystem = lightSystem else { return }
+        let count = max(lightSystem.lights.count, 1)
+        selectedLightIndex = min(max(index, 0), count - 1)
+        updateSelectedLightControls()
+        updateLightLabels()
+    }
+
+    @objc private func selectPrevLight() {
+        selectLightIndex(selectedLightIndex - 1)
+    }
+
+    @objc private func selectNextLight() {
+        selectLightIndex(selectedLightIndex + 1)
+    }
+
+    @objc private func lightColorTapped(_ sender: UIButton) {
+        let index = max(0, min(sender.tag, lightColorPalette.count - 1))
+        let color = lightColorPalette[index]
+        updateSelectedLight { $0.color = color }
+        if selectedLightIndex == 0 {
+            lightSystem?.lightColor = color
+        }
+        updateSelectedLightControls()
+    }
+
+    @objc private func lightShadowChanged(_ sender: UISwitch) {
+        updateSelectedLight { $0.castsShadow = sender.isOn }
+        if selectedLightIndex == 0 {
+            lightSystem?.primaryCastsShadow = sender.isOn
+        }
     }
 
     private func updateLightLabels() {
@@ -285,6 +566,12 @@ class GameViewController: UIViewController {
         lightYValueLabel.text = String(format: "%.2f", lightYSlider.value)
         lightZValueLabel.text = String(format: "%.2f", lightZSlider.value)
         ambientValueLabel.text = String(format: "%.2f", ambientSlider.value)
+        shadowStrengthValueLabel.text = String(format: "%.2f", shadowStrengthSlider.value)
+        shadowNearValueLabel.text = String(format: "%.3f", shadowNearSlider.value)
+        shadowFarValueLabel.text = String(format: "%.2f", shadowFarSlider.value)
+        shadowFovValueLabel.text = String(format: "%.1f", shadowFovSlider.value)
+        lightIntensityValueLabel.text = String(format: "%.1f", lightIntensitySlider.value)
+        lightAttenuationValueLabel.text = String(format: "%.2f", lightAttenuationSlider.value)
     }
 
     private func configureDisplayLink() {
@@ -292,6 +579,68 @@ class GameViewController: UIViewController {
         let link = CADisplayLink(target: self, selector: #selector(renderLoop))
         link.add(to: .main, forMode: .common)
         displayLink = link
+    }
+
+    private func configureColoredLights(center: SIMD3<Float>, target: SIMD3<Float>, radius: Float) {
+        guard let lightSystem = lightSystem else { return }
+        let r = max(radius, 0.001)
+
+        lightSystem.lightColor = SIMD3<Float>(1.0, 0.9, 0.7)
+        lightSystem.lightIntensity = 2.0
+        lightSystem.ambientIntensity = 0.5
+        lightSystem.innerConeAngle = radians_from_degrees(20)
+        lightSystem.outerConeAngle = radians_from_degrees(45)
+        lightSystem.primaryCastsShadow = true
+        lightSystem.primaryCastsVolume = true
+        lightSystem.activeLightCount = 4
+        lightSystem.orbitEnabled = false
+        lightSystem.orbitAffectsPrimary = false
+        let primary = LightingSystem.SpotLight(position: lightSystem.lightPosition,
+                                               target: target,
+                                               color: SIMD3<Float>(1.0, 0.9, 0.7),
+                                               intensity: lightSystem.lightIntensity,
+                                               innerConeAngle: radians_from_degrees(20),
+                                               outerConeAngle: radians_from_degrees(45),
+                                               shadowNear: lightSystem.shadowNear,
+                                               shadowFar: max(r * 6.0, 10.0),
+                                               castsShadow: true,
+                                               castsVolume: true)
+
+        let warm = LightingSystem.SpotLight(position: center + SIMD3<Float>(-r, r * 1.1, r * 0.3),
+                                            target: target,
+                                            color: SIMD3<Float>(1.0, 0.5, 0.2),
+                                            intensity: 0.85,
+                                            innerConeAngle: radians_from_degrees(10),
+                                            outerConeAngle: radians_from_degrees(20),
+                                            shadowNear: lightSystem.shadowNear,
+                                            shadowFar: max(r * 6.0, 10.0),
+                                            castsShadow: false,
+                                            castsVolume: true)
+
+        let cool = LightingSystem.SpotLight(position: center + SIMD3<Float>(r * 0.6, r * 1.3, -r * 0.6),
+                                            target: target,
+                                            color: SIMD3<Float>(0.3, 0.8, 1.0),
+                                            intensity: 0.8,
+                                            innerConeAngle: radians_from_degrees(12),
+                                            outerConeAngle: radians_from_degrees(22),
+                                            shadowNear: lightSystem.shadowNear,
+                                            shadowFar: max(r * 6.0, 10.0),
+                                            castsShadow: false,
+                                            castsVolume: true)
+
+        let magenta = LightingSystem.SpotLight(position: center + SIMD3<Float>(r * 0.7, r * 0.8, r * 0.9),
+                                               target: target,
+                                               color: SIMD3<Float>(0.8, 0.3, 1.0),
+                                               intensity: 0.75,
+                                               innerConeAngle: radians_from_degrees(11),
+                                               outerConeAngle: radians_from_degrees(20),
+                                               shadowNear: lightSystem.shadowNear,
+                                               shadowFar: max(r * 6.0, 10.0),
+                                               castsShadow: false,
+                                               castsVolume: true)
+
+        lightSystem.lights = [primary, warm, cool, magenta]
+        lightSystem.configureRandomOrbits(center: center, radius: r * 1.1)
     }
 
     private func configureOrbitControls() {
@@ -313,6 +662,17 @@ class GameViewController: UIViewController {
         modelAnimationSystem.setAutoAnimation(newAuto)
         updateDebugButtonState()
         updateFrameLabel()
+    }
+
+    @objc private func toggleShadows() {
+        guard let lightSystem = lightSystem else { return }
+        lightSystem.shadowEnabled.toggle()
+        updateDebugButtonState()
+    }
+
+    @objc private func toggleVolumetric() {
+        volumetricLightSystem?.isEnabled.toggle()
+        updateDebugButtonState()
     }
 
     @objc private func stepAnimation() {
@@ -384,5 +744,11 @@ class GameViewController: UIViewController {
         let isAuto = modelAnimationSystem.isAutoAnimation
         toggleModeButton.setTitle(isAuto ? "Auto: ON" : "Auto: OFF", for: .normal)
         stepButton.isHidden = isAuto
+        if let lightSystem = lightSystem {
+            shadowToggleButton.setTitle(lightSystem.shadowEnabled ? "Shadows: ON" : "Shadows: OFF", for: .normal)
+        }
+        if let volumetricLightSystem = volumetricLightSystem {
+            volumeToggleButton.setTitle(volumetricLightSystem.isEnabled ? "Volume: ON" : "Volume: OFF", for: .normal)
+        }
     }
 }

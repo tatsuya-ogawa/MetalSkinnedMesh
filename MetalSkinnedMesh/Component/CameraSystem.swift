@@ -8,7 +8,7 @@
 import MetalKit
 import simd
 
-final class CameraSystem: NSObject, GameSystem, RenderSystem {
+final class CameraSystem: NSObject, GameSystem {
     private(set) var projectionMatrix: matrix_float4x4 = matrix_identity_float4x4
     private(set) var viewMatrix: matrix_float4x4 = matrix_identity_float4x4
 
@@ -53,13 +53,6 @@ final class CameraSystem: NSObject, GameSystem, RenderSystem {
         // Camera is static unless target/size changes.
     }
 
-    func draw(renderEncoder: MTLRenderCommandEncoder,
-              frameIndex: Int,
-              viewMatrix: matrix_float4x4,
-              projectionMatrix: matrix_float4x4) {
-        // Camera system does not render geometry.
-    }
-
     func drawableSizeWillChange(_ size: CGSize) {
         guard size.width > 0, size.height > 0 else { return }
         aspectRatio = Float(size.width) / Float(size.height)
@@ -83,23 +76,4 @@ final class CameraSystem: NSObject, GameSystem, RenderSystem {
     }
 }
 
-private func matrix_look_at(eye: SIMD3<Float>,
-                            center: SIMD3<Float>,
-                            up: SIMD3<Float>) -> matrix_float4x4 {
-    let zAxis = normalize(eye - center)
-    let xAxis = normalize(cross(up, zAxis))
-    let yAxis = cross(zAxis, xAxis)
-
-    let translation = SIMD3<Float>(
-        -dot(xAxis, eye),
-        -dot(yAxis, eye),
-        -dot(zAxis, eye)
-    )
-
-    return matrix_float4x4(columns: (
-        SIMD4<Float>(xAxis.x, yAxis.x, zAxis.x, 0),
-        SIMD4<Float>(xAxis.y, yAxis.y, zAxis.y, 0),
-        SIMD4<Float>(xAxis.z, yAxis.z, zAxis.z, 0),
-        SIMD4<Float>(translation.x, translation.y, translation.z, 1)
-    ))
-}
+// matrix_look_at is defined in ModelAnimationSystem.swift (module-wide utility)

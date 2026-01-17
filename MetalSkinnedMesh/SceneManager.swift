@@ -15,14 +15,6 @@ protocol GameSystem: AnyObject {
     func update(deltaTime: TimeInterval, frameIndex: Int)
 }
 
-protocol RenderSystem: AnyObject {
-    func draw(renderEncoder: MTLRenderCommandEncoder,
-              frameIndex: Int,
-              viewMatrix: matrix_float4x4,
-              projectionMatrix: matrix_float4x4)
-    func drawableSizeWillChange(_ size: CGSize)
-}
-
 // MARK: - Scene
 
 /// Scene wraps camera, game systems, and render systems together
@@ -30,31 +22,34 @@ protocol RenderSystem: AnyObject {
 final class SceneManager {
     private weak var view: MTKView?
     let cameraSystem: CameraSystem
+    let lightManager: LightManager
     private(set) var gameSystems: [GameSystem]
-    private(set) var renderSystems: [RenderSystem]
+    private(set) var renderables: [Renderable]
     
     init(view: MTKView,
          cameraSystem: CameraSystem,
+         lightManager: LightManager,
          gameSystems: [GameSystem] = [],
-         renderSystems: [RenderSystem] = []) {
+         renderables: [Renderable] = []) {
         self.view = view
         self.cameraSystem = cameraSystem
+        self.lightManager = lightManager
         self.gameSystems = gameSystems
-        self.renderSystems = renderSystems
+        self.renderables = renderables
     }
     
     func addGameSystem(_ system: GameSystem) {
         gameSystems.append(system)
     }
     
-    func addRenderSystem(_ system: RenderSystem) {
-        renderSystems.append(system)
+    func addRenderable(_ renderable: Renderable) {
+        renderables.append(renderable)
     }
     
-    /// Convenience: add a system that implements both GameSystem and RenderSystem
-    func addSystem(_ system: GameSystem & RenderSystem) {
+    /// Convenience: add a system that implements both GameSystem and Renderable
+    func addSystem(_ system: GameSystem & Renderable) {
         gameSystems.append(system)
-        renderSystems.append(system)
+        renderables.append(system)
     }
     
     var viewMatrix: matrix_float4x4 {
@@ -81,17 +76,32 @@ final class SceneManager {
     
     func drawableSizeWillChange(_ size: CGSize) {
         cameraSystem.drawableSizeWillChange(size)
-        for system in renderSystems {
-            system.drawableSizeWillChange(size)
+        for renderable in renderables {
+            renderable.drawableSizeWillChange(size)
         }
     }
     
     func draw(renderEncoder: MTLRenderCommandEncoder, frameIndex: Int) {
-        for system in renderSystems {
-            system.draw(renderEncoder: renderEncoder,
-                       frameIndex: frameIndex,
-                       viewMatrix: viewMatrix,
-                       projectionMatrix: projectionMatrix)
+        lightManager.updateFrame(viewMatrix: viewMatrix, frameIndex: frameIndex)
+        for renderable in renderables {
+            renderable.encodeOpaque(renderEncoder: renderEncoder,
+                                    frameIndex: frameIndex,
+                                    viewMatrix: viewMatrix,
+                                    projectionMatrix: projectionMatrix,
+                                    lightManager: lightManager)
         }
+        for renderable in renderables {
+            renderable.encodeTransparent(renderEncoder: renderEncoder,
+                                         frameIndex: frameIndex,
+                                         viewMatrix: viewMatrix,
+                                         projectionMatrix: projectionMatrix,
+                                         lightManager: lightManager)
+        }
+    }
+    
+    func encodeShadowPasses(commandBuffer: MTLCommandBuffer, frameIndex: Int) {
+        lightManager.encodeShadowPasses(commandBuffer: commandBuffer,
+                                        frameIndex: frameIndex,
+                                        renderables: renderables)
     }
 }
