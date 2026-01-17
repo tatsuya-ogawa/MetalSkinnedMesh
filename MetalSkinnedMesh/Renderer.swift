@@ -41,6 +41,8 @@ final class Renderer: NSObject, MTKViewDelegate {
         let semaphore = inFlightSemaphore
         commandBuffer.addCompletedHandler { _ in semaphore.signal() }
 
+        scene.encodeShadowPasses(commandBuffer: commandBuffer, frameIndex: frameIndex)
+
         guard let renderPassDescriptor = view.currentRenderPassDescriptor,
               let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor) else {
             commandBuffer.commit()
