@@ -52,6 +52,7 @@ private struct MeshSkinning {
     let geometryBindTransform: matrix_float4x4
     let geometryBindTransformInverse: matrix_float4x4
     var jointToSkeletonIndex: [Int]
+    var boneColorBuffer: MTLBuffer?
 }
 
 // Mesh with all its submeshes
@@ -84,6 +85,7 @@ final class ModelAnimationSystem: NSObject, GameSystem, Renderable {
     var shadowDepthState: MTLDepthStencilState
     fileprivate var defaultMaterialTextures: MaterialTextures
     var defaultJointMatricesBuffer: MTLBuffer
+    var defaultBoneColorBuffer: MTLBuffer
     
     private var currentUniformBufferOffset = 0
     private var currentFrameIndex = 0
@@ -91,6 +93,15 @@ final class ModelAnimationSystem: NSObject, GameSystem, Renderable {
     
     var rotation: Float = 0
     private(set) var modelMatrix: matrix_float4x4 = matrix_identity_float4x4
+
+    var boneColorDebugEnabled = false
+    var boneColorAlpha: Float = 0.5
+    var hiddenBoneAlpha: Float = 0.05
+    private(set) var jointPaths: [String] = []
+    private(set) var jointVisibility: [Bool] = []
+    private(set) var skeletonBoneColors: [SIMD4<Float>] = []
+    private(set) var currentGlobalTransforms: [matrix_float4x4] = []
+    private(set) var skeletonToMeshTransform: matrix_float4x4 = matrix_identity_float4x4
     
     // All meshes from the USDZ
     fileprivate var meshes: [MeshData] = []
@@ -215,6 +226,15 @@ final class ModelAnimationSystem: NSObject, GameSystem, Renderable {
         defaultJointMatricesBuffer = jointBuffer
         var identity = matrix_identity_float4x4
         defaultJointMatricesBuffer.contents().copyMemory(from: &identity, byteCount: jointBufferLength)
+
+        var defaultBoneColor = SIMD4<Float>(0.6, 0.6, 0.6, 1.0)
+        guard let boneColorBuffer = device.makeBuffer(length: MemoryLayout<SIMD4<Float>>.stride,
+                                                      options: [.storageModeShared]) else {
+            return nil
+        }
+        boneColorBuffer.contents().copyMemory(from: &defaultBoneColor,
+                                              byteCount: MemoryLayout<SIMD4<Float>>.stride)
+        defaultBoneColorBuffer = boneColorBuffer
         
         super.init()
         
@@ -443,7 +463,8 @@ final class ModelAnimationSystem: NSObject, GameSystem, Renderable {
                                             jointMatricesBuffers: jointBuffers,
                                             geometryBindTransform: geometryBindTransform,
                                             geometryBindTransformInverse: geometryBindTransformInverse,
-                                            jointToSkeletonIndex: [])
+                                            jointToSkeletonIndex: [],
+                                            boneColorBuffer: nil)
                 }
             }
             
@@ -545,6 +566,11 @@ final class ModelAnimationSystem: NSObject, GameSystem, Renderable {
             restTransforms = []
             inverseBindTransforms = []
             jointParentIndices = []
+            jointPaths = []
+            jointVisibility = []
+            skeletonBoneColors = []
+            currentGlobalTransforms = []
+            skeletonToMeshTransform = matrix_identity_float4x4
             return
         }
         
@@ -553,6 +579,10 @@ final class ModelAnimationSystem: NSObject, GameSystem, Renderable {
         
         
         let jointPaths = skeleton.jointPaths
+        self.jointPaths = jointPaths
+        jointVisibility = Array(repeating: true, count: jointPaths.count)
+        skeletonBoneColors = buildBoneColorPalette(count: jointPaths.count)
+        let visibleSkeletonColors = skeletonColorsForVisibility()
         let pathToIndex = buildPathIndexMap(from: jointPaths)
         let tailToIndex = buildTailIndexMap(from: jointPaths)
         jointParentIndices = jointPaths.map { path in
@@ -618,7 +648,8 @@ final class ModelAnimationSystem: NSObject, GameSystem, Renderable {
                                                 jointMatricesBuffers: jointBuffers,
                                                 geometryBindTransform: skinning.geometryBindTransform,
                                                 geometryBindTransformInverse: skinning.geometryBindTransformInverse,
-                                                jointToSkeletonIndex: [])
+                                                jointToSkeletonIndex: [],
+                                                boneColorBuffer: nil)
                     } else {
                         jointPathsForMesh = skinning.jointPaths
                     }
@@ -633,8 +664,140 @@ final class ModelAnimationSystem: NSObject, GameSystem, Renderable {
                 }
             }
 
+            let meshBoneColors = makeMeshBoneColors(jointCount: jointPathsForMesh.count,
+                                                    jointToSkeletonIndex: skinning.jointToSkeletonIndex,
+                                                    skeletonColors: visibleSkeletonColors)
+            skinning.boneColorBuffer = makeBoneColorBuffer(colors: meshBoneColors) ?? defaultBoneColorBuffer
+
             meshes[index].skinning = skinning
         }
+
+        if let firstSkinning = meshes.compactMap({ $0.skinning }).first {
+            skeletonToMeshTransform = firstSkinning.geometryBindTransformInverse
+        } else {
+            skeletonToMeshTransform = matrix_identity_float4x4
+        }
+    }
+
+    private func buildBoneColorPalette(count: Int) -> [SIMD4<Float>] {
+        guard count > 0 else { return [] }
+        var colors: [SIMD4<Float>] = []
+        colors.reserveCapacity(count)
+        let goldenRatio: Float = 0.61803398875
+        var hue: Float = 0.0
+        for _ in 0..<count {
+            hue = fmodf(hue + goldenRatio, 1.0)
+            let rgb = hsvToRgb(h: hue, s: 0.65, v: 0.95)
+            colors.append(SIMD4<Float>(rgb.x, rgb.y, rgb.z, 1.0))
+        }
+        return colors
+    }
+
+    private func skeletonColorsForVisibility() -> [SIMD4<Float>] {
+        guard !skeletonBoneColors.isEmpty else { return [] }
+        var colors = skeletonBoneColors
+        let count = min(colors.count, jointVisibility.count)
+        for index in 0..<count {
+            colors[index].w = jointVisibility[index] ? 1.0 : hiddenBoneAlpha
+        }
+        return colors
+    }
+
+    private func makeMeshBoneColors(jointCount: Int,
+                                    jointToSkeletonIndex: [Int],
+                                    skeletonColors: [SIMD4<Float>]) -> [SIMD4<Float>] {
+        let count = max(jointCount, 1)
+        if skeletonColors.isEmpty || jointToSkeletonIndex.isEmpty {
+            let fallback = buildBoneColorPalette(count: count)
+            return fallback.isEmpty ? [SIMD4<Float>(0.6, 0.6, 0.6, 1.0)] : fallback
+        }
+
+        var colors = Array(repeating: SIMD4<Float>(0.6, 0.6, 0.6, 1.0), count: count)
+        for i in 0..<count {
+            let skeletonIndex = i < jointToSkeletonIndex.count ? jointToSkeletonIndex[i] : -1
+            if skeletonIndex >= 0 && skeletonIndex < skeletonColors.count {
+                colors[i] = skeletonColors[skeletonIndex]
+            } else if i < skeletonColors.count {
+                colors[i] = skeletonColors[i]
+            }
+        }
+        return colors
+    }
+
+    private func updateBoneColorBuffers() {
+        let visibleSkeletonColors = skeletonColorsForVisibility()
+        for index in meshes.indices {
+            guard var skinning = meshes[index].skinning else { continue }
+            let jointCount = max(skinning.jointPaths.count, 1)
+            let meshBoneColors = makeMeshBoneColors(jointCount: jointCount,
+                                                    jointToSkeletonIndex: skinning.jointToSkeletonIndex,
+                                                    skeletonColors: visibleSkeletonColors)
+            if let buffer = skinning.boneColorBuffer {
+                updateBoneColorBuffer(buffer, colors: meshBoneColors)
+            } else {
+                skinning.boneColorBuffer = makeBoneColorBuffer(colors: meshBoneColors) ?? defaultBoneColorBuffer
+                meshes[index].skinning = skinning
+            }
+        }
+    }
+
+    private func makeBoneColorBuffer(colors: [SIMD4<Float>]) -> MTLBuffer? {
+        let count = max(colors.count, 1)
+        let length = count * MemoryLayout<SIMD4<Float>>.stride
+        guard let buffer = device.makeBuffer(length: length, options: [.storageModeShared]) else {
+            return nil
+        }
+        if colors.isEmpty {
+            var fallback = SIMD4<Float>(0.6, 0.6, 0.6, 1.0)
+            buffer.contents().copyMemory(from: &fallback, byteCount: MemoryLayout<SIMD4<Float>>.stride)
+        } else {
+            colors.withUnsafeBytes { bytes in
+                if let base = bytes.baseAddress {
+                    buffer.contents().copyMemory(from: base, byteCount: length)
+                }
+            }
+        }
+        return buffer
+    }
+
+    private func updateBoneColorBuffer(_ buffer: MTLBuffer, colors: [SIMD4<Float>]) {
+        let count = max(colors.count, 1)
+        let length = count * MemoryLayout<SIMD4<Float>>.stride
+        if colors.isEmpty {
+            var fallback = SIMD4<Float>(0.6, 0.6, 0.6, 1.0)
+            buffer.contents().copyMemory(from: &fallback,
+                                         byteCount: min(MemoryLayout<SIMD4<Float>>.stride, buffer.length))
+            return
+        }
+        colors.withUnsafeBytes { bytes in
+            if let base = bytes.baseAddress {
+                buffer.contents().copyMemory(from: base,
+                                             byteCount: min(length, buffer.length))
+            }
+        }
+    }
+
+    private func hsvToRgb(h: Float, s: Float, v: Float) -> SIMD3<Float> {
+        let hh = (h - floorf(h)) * 6.0
+        let c = v * s
+        let x = c * (1.0 - fabsf(fmodf(hh, 2.0) - 1.0))
+        let (r1, g1, b1): (Float, Float, Float)
+        switch hh {
+        case 0..<1:
+            (r1, g1, b1) = (c, x, 0)
+        case 1..<2:
+            (r1, g1, b1) = (x, c, 0)
+        case 2..<3:
+            (r1, g1, b1) = (0, c, x)
+        case 3..<4:
+            (r1, g1, b1) = (0, x, c)
+        case 4..<5:
+            (r1, g1, b1) = (x, 0, c)
+        default:
+            (r1, g1, b1) = (c, 0, x)
+        }
+        let m = v - c
+        return SIMD3<Float>(r1 + m, g1 + m, b1 + m)
     }
     
     private func parentJointPath(for path: String) -> String? {
@@ -919,6 +1082,7 @@ final class ModelAnimationSystem: NSObject, GameSystem, Renderable {
         }
 
         let globalTransforms = buildGlobalTransforms(from: localTransforms)
+        currentGlobalTransforms = globalTransforms
         let skeletonCount = min(globalTransforms.count, inverseBindTransforms.count)
         if skeletonCount == 0 { return }
 
@@ -1017,6 +1181,20 @@ final class ModelAnimationSystem: NSObject, GameSystem, Renderable {
         let frame = Int(round(offset * fps)) % max(totalFrames, 1)
         return (frame: frame, totalFrames: totalFrames, time: time)
     }
+
+    func setJointVisible(_ index: Int, visible: Bool) {
+        guard jointVisibility.indices.contains(index) else { return }
+        jointVisibility[index] = visible
+        updateBoneColorBuffers()
+    }
+
+    func setAllJointsVisible(_ visible: Bool) {
+        guard !jointVisibility.isEmpty else { return }
+        for index in jointVisibility.indices {
+            jointVisibility[index] = visible
+        }
+        updateBoneColorBuffers()
+    }
     
     private func buildGlobalTransforms(from localTransforms: [matrix_float4x4]) -> [matrix_float4x4] {
         var globalTransforms = Array(repeating: matrix_identity_float4x4, count: localTransforms.count)
@@ -1093,6 +1271,9 @@ final class ModelAnimationSystem: NSObject, GameSystem, Renderable {
                       viewMatrix: matrix_float4x4,
                       projectionMatrix: matrix_float4x4,
                       lightManager: LightManager) {
+        if boneColorDebugEnabled {
+            return
+        }
         uniforms[0].projectionMatrix = projectionMatrix
         uniforms[0].modelViewMatrix = simd_mul(viewMatrix, modelMatrix)
         uniforms[0].modelMatrix = modelMatrix
@@ -1113,7 +1294,10 @@ final class ModelAnimationSystem: NSObject, GameSystem, Renderable {
 
         renderEncoder.setRenderPipelineState(pipelineState)
         renderEncoder.setDepthStencilState(depthState)
-        drawMeshes(renderEncoder: renderEncoder, frameIndex: frameIndex, transparentPass: false)
+        drawMeshes(renderEncoder: renderEncoder,
+                   frameIndex: frameIndex,
+                   transparentPass: false,
+                   forceAllSubmeshes: false)
         renderEncoder.popDebugGroup()
     }
 
@@ -1126,7 +1310,8 @@ final class ModelAnimationSystem: NSObject, GameSystem, Renderable {
         uniforms[0].modelViewMatrix = simd_mul(viewMatrix, modelMatrix)
         uniforms[0].modelMatrix = modelMatrix
         lightManager.applyLightUniforms(uniforms)
-        uniforms[0].padding0 = SIMD4<Float>(0, 0, lightManager.shadowStrength, lightManager.attenuationPower)
+        let debugFlag: Float = boneColorDebugEnabled ? 1.0 : 0.0
+        uniforms[0].padding0 = SIMD4<Float>(debugFlag, boneColorAlpha, lightManager.shadowStrength, lightManager.attenuationPower)
 
         renderEncoder.pushDebugGroup("Draw Model Transparent")
         renderEncoder.setCullMode(.back)
@@ -1142,11 +1327,17 @@ final class ModelAnimationSystem: NSObject, GameSystem, Renderable {
 
         renderEncoder.setRenderPipelineState(transparentPipelineState)
         renderEncoder.setDepthStencilState(transparentDepthState)
-        drawMeshes(renderEncoder: renderEncoder, frameIndex: frameIndex, transparentPass: true)
+        drawMeshes(renderEncoder: renderEncoder,
+                   frameIndex: frameIndex,
+                   transparentPass: true,
+                   forceAllSubmeshes: boneColorDebugEnabled)
         renderEncoder.popDebugGroup()
     }
     
-    private func drawMeshes(renderEncoder: MTLRenderCommandEncoder, frameIndex: Int, transparentPass: Bool) {
+    private func drawMeshes(renderEncoder: MTLRenderCommandEncoder,
+                            frameIndex: Int,
+                            transparentPass: Bool,
+                            forceAllSubmeshes: Bool) {
         for meshData in meshes {
             let mtkMesh = meshData.mtkMesh
             let jointBuffer: MTLBuffer
@@ -1157,6 +1348,8 @@ final class ModelAnimationSystem: NSObject, GameSystem, Renderable {
                 jointBuffer = defaultJointMatricesBuffer
             }
             renderEncoder.setVertexBuffer(jointBuffer, offset: 0, index: BufferIndex.jointMatrices.rawValue)
+            let boneColorBuffer = meshData.skinning?.boneColorBuffer ?? defaultBoneColorBuffer
+            renderEncoder.setVertexBuffer(boneColorBuffer, offset: 0, index: BufferIndex.boneColors.rawValue)
 
             for (bufferIndex, vertexBuffer) in mtkMesh.vertexBuffers.enumerated() {
                 renderEncoder.setVertexBuffer(vertexBuffer.buffer, offset: vertexBuffer.offset, index: bufferIndex)
@@ -1164,7 +1357,7 @@ final class ModelAnimationSystem: NSObject, GameSystem, Renderable {
 
             for submeshData in meshData.submeshes {
                 // Filter based on transparency
-                if submeshData.isTransparent != transparentPass {
+                if !forceAllSubmeshes && submeshData.isTransparent != transparentPass {
                     continue
                 }
                 

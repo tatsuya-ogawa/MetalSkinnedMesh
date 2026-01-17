@@ -41,6 +41,7 @@ typedef struct
     float3 viewNormal;
     float3 viewTangent;
     float3 viewBitangent;
+    float4 boneColor;
 } ColorInOut;
 
 typedef struct
@@ -78,7 +79,8 @@ typedef struct
 
 vertex ColorInOut vertexShader(Vertex in [[stage_in]],
                                constant Uniforms & uniforms [[ buffer(BufferIndexUniforms) ]],
-                               constant float4x4 *jointMatrices [[ buffer(BufferIndexJointMatrices) ]])
+                               constant float4x4 *jointMatrices [[ buffer(BufferIndexJointMatrices) ]],
+                               constant float4 *boneColors [[ buffer(BufferIndexBoneColors) ]])
 {
     ColorInOut out;
 
@@ -91,6 +93,13 @@ vertex ColorInOut vertexShader(Vertex in [[stage_in]],
     if (weights.x + weights.y + weights.z + weights.w < 0.0001) {
         weights = float4(1.0, 0.0, 0.0, 0.0);
     }
+
+    uint bestIndex = in.jointIndices.x;
+    float bestWeight = weights.x;
+    if (weights.y > bestWeight) { bestWeight = weights.y; bestIndex = in.jointIndices.y; }
+    if (weights.z > bestWeight) { bestWeight = weights.z; bestIndex = in.jointIndices.z; }
+    if (weights.w > bestWeight) { bestWeight = weights.w; bestIndex = in.jointIndices.w; }
+    out.boneColor = boneColors[bestIndex];
 
     float4 n4 = float4(in.normal, 0.0);
     float4 t4 = float4(in.tangent.xyz, 0.0);
@@ -275,6 +284,11 @@ fragment float4 fragmentShader(ColorInOut in [[stage_in]],
                                texture2d<half> opacityMap [[ texture(TextureIndexOpacity) ]],
                                depth2d_array<float, access::sample> shadowMap [[ texture(TextureIndexShadowMap) ]])
 {
+    if (uniforms.padding0.x > 0.5) {
+        float alpha = clamp(uniforms.padding0.y * in.boneColor.a, 0.0, 1.0);
+        return float4(in.boneColor.rgb, alpha);
+    }
+
     constexpr sampler colorSampler(mip_filter::linear,
                                    mag_filter::linear,
                                    min_filter::linear);
@@ -380,6 +394,33 @@ fragment float4 fragmentShader(ColorInOut in [[stage_in]],
     color = ambient + color + emissiveSample;
 
     return float4(color, baseColorSample.a * opacity);
+}
+
+typedef struct
+{
+    float3 position [[attribute(0)]];
+    float4 color [[attribute(1)]];
+} BoneLineVertex;
+
+typedef struct
+{
+    float4 position [[position]];
+    float4 color;
+} BoneLineOut;
+
+vertex BoneLineOut boneLineVertexShader(BoneLineVertex in [[stage_in]],
+                                        constant Uniforms & uniforms [[ buffer(BufferIndexUniforms) ]])
+{
+    BoneLineOut out;
+    float4 viewPos = uniforms.modelViewMatrix * float4(in.position, 1.0);
+    out.position = uniforms.projectionMatrix * viewPos;
+    out.color = in.color;
+    return out;
+}
+
+fragment float4 boneLineFragmentShader(BoneLineOut in [[stage_in]])
+{
+    return in.color;
 }
 
 static inline float sampleShadowPCF(depth2d_array<float, access::sample> shadowMap,
