@@ -38,7 +38,8 @@ typedef NS_ENUM(EnumBackingType, BufferIndex)
     BufferIndexJointMatrices    = 7,
     BufferIndexLights           = 8,
     BufferIndexShadowUniforms   = 9,
-    BufferIndexVolumeUniforms   = 10
+    BufferIndexVolumeUniforms   = 10,
+    BufferIndexBoneColors       = 11
 };
 
 typedef NS_ENUM(EnumBackingType, VertexAttribute)

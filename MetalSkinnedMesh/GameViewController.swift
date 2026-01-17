@@ -24,9 +24,17 @@ class GameViewController: UIViewController {
     private let stepButton = UIButton(type: .system)
     private let shadowToggleButton = UIButton(type: .system)
     private let volumeToggleButton = UIButton(type: .system)
+    private let boneDebugButton = UIButton(type: .system)
     private let frameLabel = UILabel()
     private let lightPanelContainer = UIView()
     private let lightPanelStack = UIStackView()
+    private let bonePanelContainer = UIView()
+    private let bonePanelStack = UIStackView()
+    private let boneScrollView = UIScrollView()
+    private let boneListStack = UIStackView()
+    private let boneAllOnButton = UIButton(type: .system)
+    private let boneAllOffButton = UIButton(type: .system)
+    private var boneVisibilitySwitches: [UISwitch] = []
     private let lightXSlider = UISlider()
     private let lightYSlider = UISlider()
     private let lightZSlider = UISlider()
@@ -67,6 +75,7 @@ class GameViewController: UIViewController {
     private let debugFPS: Double = 30.0
     private var volumetricLightSystem: VolumetricLightSystem!
     private var floorRenderable: FloorRenderable?
+    private var skeletonDebugRenderable: SkeletonDebugRenderable?
 
     override var canBecomeFirstResponder: Bool {
         true
@@ -143,16 +152,24 @@ class GameViewController: UIViewController {
             return
         }
         self.floorRenderable = floorRenderable
+
+        let skeletonDebugRenderable = SkeletonDebugRenderable(metalKitView: mtkView,
+                                                             modelSystem: modelAnimationSystem)
+        self.skeletonDebugRenderable = skeletonDebugRenderable
         
         // Configure camera based on loaded model size
         cameraSystem.setTarget(radius: modelAnimationSystem.meshRadius)
 
         // Create scene with camera, game systems, and render systems
+        var renderables: [Renderable] = [floorRenderable, modelAnimationSystem, volumetricLightSystem]
+        if let skeletonDebugRenderable = skeletonDebugRenderable {
+            renderables.append(skeletonDebugRenderable)
+        }
         scene = SceneManager(view: mtkView,
                      cameraSystem: cameraSystem,
                      lightManager: lightManager,
                      gameSystems: [modelAnimationSystem, lightSystem],
-                     renderables: [floorRenderable, modelAnimationSystem, volumetricLightSystem])
+                     renderables: renderables)
         
         guard let newRenderer = Renderer(metalKitView: mtkView, scene: scene) else {
             print("Renderer cannot be initialized")
@@ -168,6 +185,7 @@ class GameViewController: UIViewController {
         configureDebugButtons()
         configureFrameLabel()
         configureLightPanel(radius: radius)
+        configureBonePanel()
         configureOrbitControls()
         configureDisplayLink()
     }
@@ -182,6 +200,7 @@ class GameViewController: UIViewController {
         stepButton.translatesAutoresizingMaskIntoConstraints = false
         shadowToggleButton.translatesAutoresizingMaskIntoConstraints = false
         volumeToggleButton.translatesAutoresizingMaskIntoConstraints = false
+        boneDebugButton.translatesAutoresizingMaskIntoConstraints = false
 
         toggleModeButton.setTitle("Auto: ON", for: .normal)
         toggleModeButton.addTarget(self, action: #selector(toggleAnimationMode), for: .touchUpInside)
@@ -212,10 +231,18 @@ class GameViewController: UIViewController {
         volumeToggleButton.layer.cornerRadius = 8
         volumeToggleButton.contentEdgeInsets = UIEdgeInsets(top: 8, left: 12, bottom: 8, right: 12)
 
+        boneDebugButton.setTitle("Bones: OFF", for: .normal)
+        boneDebugButton.addTarget(self, action: #selector(toggleBoneDebug), for: .touchUpInside)
+        boneDebugButton.backgroundColor = UIColor(white: 0.1, alpha: 0.7)
+        boneDebugButton.setTitleColor(.white, for: .normal)
+        boneDebugButton.layer.cornerRadius = 8
+        boneDebugButton.contentEdgeInsets = UIEdgeInsets(top: 8, left: 12, bottom: 8, right: 12)
+
         view.addSubview(toggleModeButton)
         view.addSubview(stepButton)
         view.addSubview(shadowToggleButton)
         view.addSubview(volumeToggleButton)
+        view.addSubview(boneDebugButton)
 
         let safeArea = view.safeAreaLayoutGuide
         NSLayoutConstraint.activate([
@@ -229,7 +256,10 @@ class GameViewController: UIViewController {
             shadowToggleButton.centerYAnchor.constraint(equalTo: toggleModeButton.centerYAnchor),
 
             volumeToggleButton.leadingAnchor.constraint(equalTo: shadowToggleButton.trailingAnchor, constant: 12),
-            volumeToggleButton.centerYAnchor.constraint(equalTo: toggleModeButton.centerYAnchor)
+            volumeToggleButton.centerYAnchor.constraint(equalTo: toggleModeButton.centerYAnchor),
+
+            boneDebugButton.leadingAnchor.constraint(equalTo: toggleModeButton.leadingAnchor),
+            boneDebugButton.topAnchor.constraint(equalTo: toggleModeButton.bottomAnchor, constant: 8)
         ])
 
         updateDebugButtonState()
@@ -340,6 +370,75 @@ class GameViewController: UIViewController {
         selectLightIndex(selectedLightIndex)
     }
 
+    private func configureBonePanel() {
+        bonePanelContainer.translatesAutoresizingMaskIntoConstraints = false
+        bonePanelContainer.backgroundColor = UIColor(white: 0.1, alpha: 0.7)
+        bonePanelContainer.layer.cornerRadius = 10
+        bonePanelContainer.layer.masksToBounds = true
+        bonePanelContainer.isHidden = true
+
+        bonePanelStack.translatesAutoresizingMaskIntoConstraints = false
+        bonePanelStack.axis = .vertical
+        bonePanelStack.spacing = 8
+
+        let titleLabel = UILabel()
+        titleLabel.text = "Bones"
+        titleLabel.textColor = .white
+        titleLabel.font = UIFont.systemFont(ofSize: 13, weight: .semibold)
+        titleLabel.setContentHuggingPriority(.required, for: .horizontal)
+
+        boneAllOnButton.setTitle("All On", for: .normal)
+        boneAllOnButton.addTarget(self, action: #selector(setAllBonesOn), for: .touchUpInside)
+        boneAllOffButton.setTitle("All Off", for: .normal)
+        boneAllOffButton.addTarget(self, action: #selector(setAllBonesOff), for: .touchUpInside)
+
+        let headerRow = UIStackView(arrangedSubviews: [titleLabel, boneAllOnButton, boneAllOffButton])
+        headerRow.axis = .horizontal
+        headerRow.spacing = 8
+        headerRow.alignment = .center
+
+        boneListStack.axis = .vertical
+        boneListStack.spacing = 6
+        boneListStack.alignment = .fill
+
+        boneScrollView.translatesAutoresizingMaskIntoConstraints = false
+        boneScrollView.showsVerticalScrollIndicator = true
+        boneScrollView.showsHorizontalScrollIndicator = true
+        boneScrollView.alwaysBounceHorizontal = true
+        boneScrollView.addSubview(boneListStack)
+
+        boneListStack.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            boneListStack.leadingAnchor.constraint(equalTo: boneScrollView.contentLayoutGuide.leadingAnchor),
+            boneListStack.trailingAnchor.constraint(equalTo: boneScrollView.contentLayoutGuide.trailingAnchor),
+            boneListStack.topAnchor.constraint(equalTo: boneScrollView.contentLayoutGuide.topAnchor),
+            boneListStack.bottomAnchor.constraint(equalTo: boneScrollView.contentLayoutGuide.bottomAnchor),
+            boneListStack.widthAnchor.constraint(greaterThanOrEqualTo: boneScrollView.frameLayoutGuide.widthAnchor)
+        ])
+
+        bonePanelStack.addArrangedSubview(headerRow)
+        bonePanelStack.addArrangedSubview(boneScrollView)
+
+        bonePanelContainer.addSubview(bonePanelStack)
+        view.addSubview(bonePanelContainer)
+
+        let safeArea = view.safeAreaLayoutGuide
+        NSLayoutConstraint.activate([
+            bonePanelContainer.leadingAnchor.constraint(equalTo: safeArea.leadingAnchor, constant: 12),
+            bonePanelContainer.bottomAnchor.constraint(equalTo: safeArea.bottomAnchor, constant: -12),
+            bonePanelContainer.widthAnchor.constraint(equalToConstant: 320),
+
+            bonePanelStack.leadingAnchor.constraint(equalTo: bonePanelContainer.leadingAnchor, constant: 12),
+            bonePanelStack.trailingAnchor.constraint(equalTo: bonePanelContainer.trailingAnchor, constant: -12),
+            bonePanelStack.topAnchor.constraint(equalTo: bonePanelContainer.topAnchor, constant: 12),
+            bonePanelStack.bottomAnchor.constraint(equalTo: bonePanelContainer.bottomAnchor, constant: -12),
+
+            boneScrollView.heightAnchor.constraint(equalToConstant: 260)
+        ])
+
+        rebuildBoneList()
+    }
+
     private func configureLightSelectionControls() {
         let selectLabel = UILabel()
         selectLabel.text = "Edit Light"
@@ -441,6 +540,73 @@ class GameViewController: UIViewController {
         row.alignment = .center
 
         lightPanelStack.addArrangedSubview(row)
+    }
+
+    private func rebuildBoneList() {
+        boneVisibilitySwitches = []
+        boneListStack.arrangedSubviews.forEach { view in
+            boneListStack.removeArrangedSubview(view)
+            view.removeFromSuperview()
+        }
+
+        guard let modelAnimationSystem = modelAnimationSystem else { return }
+        let jointPaths = modelAnimationSystem.jointPaths
+        if jointPaths.isEmpty {
+            let emptyLabel = UILabel()
+            emptyLabel.text = "No skeleton"
+            emptyLabel.textColor = UIColor(white: 1.0, alpha: 0.7)
+            emptyLabel.font = UIFont.systemFont(ofSize: 12)
+            boneListStack.addArrangedSubview(emptyLabel)
+            return
+        }
+
+        for (index, path) in jointPaths.enumerated() {
+            let depth = boneDepth(path)
+            let label = UILabel()
+            label.textColor = .white
+            label.font = UIFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium)
+            label.text = boneDisplayTitle(path, depth: depth, index: index)
+            label.numberOfLines = 1
+            label.lineBreakMode = .byTruncatingMiddle
+            label.setContentHuggingPriority(.defaultLow, for: .horizontal)
+            label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+            let toggle = UISwitch()
+            toggle.tag = index
+            toggle.isOn = modelAnimationSystem.jointVisibility.indices.contains(index)
+                ? modelAnimationSystem.jointVisibility[index]
+                : true
+            toggle.addTarget(self, action: #selector(boneVisibilityChanged(_:)), for: .valueChanged)
+            toggle.setContentHuggingPriority(.required, for: .horizontal)
+            toggle.setContentCompressionResistancePriority(.required, for: .horizontal)
+            boneVisibilitySwitches.append(toggle)
+
+            let row = UIStackView(arrangedSubviews: [label, toggle])
+            row.axis = .horizontal
+            row.spacing = 8
+            row.alignment = .center
+            boneListStack.addArrangedSubview(row)
+        }
+    }
+
+    private func boneDisplayName(_ path: String) -> String {
+        let parts = path.split(separator: "/")
+        if let last = parts.last, !last.isEmpty {
+            return String(last)
+        }
+        return path
+    }
+
+    private func boneDepth(_ path: String) -> Int {
+        let parts = path.split(separator: "/").filter { !$0.isEmpty }
+        return max(parts.count - 1, 0)
+    }
+
+    private func boneDisplayTitle(_ path: String, depth: Int, index: Int) -> String {
+        let name = boneDisplayName(path)
+        let indent = String(repeating: "  ", count: max(depth, 0))
+        let prefix = depth > 0 ? "- " : ""
+        return "\(indent)\(prefix)\(name) [\(index)]"
     }
 
     @objc private func lightSliderChanged(_ sender: UISlider) {
@@ -675,6 +841,37 @@ class GameViewController: UIViewController {
         updateDebugButtonState()
     }
 
+    @objc private func toggleBoneDebug() {
+        guard let modelAnimationSystem = modelAnimationSystem else { return }
+        modelAnimationSystem.boneColorDebugEnabled.toggle()
+        skeletonDebugRenderable?.isEnabled = modelAnimationSystem.boneColorDebugEnabled
+        if modelAnimationSystem.boneColorDebugEnabled {
+            rebuildBoneList()
+        }
+        updateDebugButtonState()
+    }
+
+    @objc private func boneVisibilityChanged(_ sender: UISwitch) {
+        guard let modelAnimationSystem = modelAnimationSystem else { return }
+        modelAnimationSystem.setJointVisible(sender.tag, visible: sender.isOn)
+    }
+
+    @objc private func setAllBonesOn() {
+        guard let modelAnimationSystem = modelAnimationSystem else { return }
+        modelAnimationSystem.setAllJointsVisible(true)
+        for toggle in boneVisibilitySwitches {
+            toggle.setOn(true, animated: true)
+        }
+    }
+
+    @objc private func setAllBonesOff() {
+        guard let modelAnimationSystem = modelAnimationSystem else { return }
+        modelAnimationSystem.setAllJointsVisible(false)
+        for toggle in boneVisibilitySwitches {
+            toggle.setOn(false, animated: true)
+        }
+    }
+
     @objc private func stepAnimation() {
         guard let modelAnimationSystem = modelAnimationSystem else { return }
         if modelAnimationSystem.isAutoAnimation {
@@ -750,5 +947,8 @@ class GameViewController: UIViewController {
         if let volumetricLightSystem = volumetricLightSystem {
             volumeToggleButton.setTitle(volumetricLightSystem.isEnabled ? "Volume: ON" : "Volume: OFF", for: .normal)
         }
+        boneDebugButton.setTitle(modelAnimationSystem.boneColorDebugEnabled ? "Bones: ON" : "Bones: OFF", for: .normal)
+        bonePanelContainer.isHidden = !modelAnimationSystem.boneColorDebugEnabled
+        lightPanelContainer.isHidden = modelAnimationSystem.boneColorDebugEnabled
     }
 }
